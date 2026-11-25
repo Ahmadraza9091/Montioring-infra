@@ -420,6 +420,27 @@ def install_nagios_plugins(values: dict[str, str], work: Path) -> None:
     log(f"Nagios Plugins {version} installed.")
 
 
+def remove_config_directives(content: str, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        content = re.sub(
+            rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=.*(?:\r?\n|$)",
+            "",
+            content,
+        )
+    return content
+
+
+def set_config_directives(content: str, directives: dict[str, str]) -> str:
+    for key, value in directives.items():
+        pattern = rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=.*$"
+        line = f"{key}={value}"
+        if re.search(pattern, content):
+            content = re.sub(pattern, line, content)
+        else:
+            content = content.rstrip() + f"\n{line}\n"
+    return content
+
+
 def configure_nagios(values: dict[str, str]) -> None:
     require_root("configure-nagios")
     require_command("htpasswd")
@@ -456,13 +477,11 @@ def configure_nagios(values: dict[str, str]) -> None:
     if not local_config.exists():
         shutil.copy2(ROOT / "configs" / "nagios" / "local.cfg", local_config)
     nagios_config = NAGIOS_ETC / "nagios.cfg"
-    content = nagios_config.read_text(encoding="utf-8")
+    original_nagios_config = nagios_config.read_text(encoding="utf-8")
+    content = original_nagios_config
     if "cfg_dir=/usr/local/nagios/etc/servers" not in content:
-        with nagios_config.open("a", encoding="utf-8") as file:
-            file.write("\ncfg_dir=/usr/local/nagios/etc/servers\n")
-    content = nagios_config.read_text(encoding="utf-8")
-    content = re.sub(r"(?m)^\s*use_authentication\s*=.*$", "use_authentication=1", content)
-    keys = (
+        content = content.rstrip() + "\ncfg_dir=/usr/local/nagios/etc/servers\n"
+    authorization_keys = (
         "authorized_for_system_information",
         "authorized_for_configuration_information",
         "authorized_for_system_commands",
@@ -471,14 +490,21 @@ def configure_nagios(values: dict[str, str]) -> None:
         "authorized_for_all_service_commands",
         "authorized_for_all_host_commands",
     )
-    for key in keys:
-        pattern = rf"(?m)^\s*{key}\s*=.*$"
-        line = f"{key}={values['NAGIOS_ADMIN_USER']}"
-        if re.search(pattern, content):
-            content = re.sub(pattern, line, content)
-        else:
-            content += f"\n{line}\n"
-    atomic_write(nagios_config, content, 0o644)
+    auth_keys = ("use_authentication", *authorization_keys)
+    content = remove_config_directives(content, auth_keys)
+    if content != original_nagios_config:
+        backup_existing(nagios_config)
+        atomic_write(nagios_config, content, nagios_config.stat().st_mode & 0o777)
+    cgi_config = NAGIOS_ETC / "cgi.cfg"
+    if not cgi_config.is_file():
+        die(f"Nagios CGI configuration is missing: {cgi_config}.")
+    cgi_content = cgi_config.read_text(encoding="utf-8")
+    cgi_directives = {"use_authentication": "1"}
+    cgi_directives.update({key: values["NAGIOS_ADMIN_USER"] for key in authorization_keys})
+    updated_cgi_content = set_config_directives(cgi_content, cgi_directives)
+    if updated_cgi_content != cgi_content:
+        backup_existing(cgi_config)
+        atomic_write(cgi_config, updated_cgi_content, cgi_config.stat().st_mode & 0o777)
     auth_file = NAGIOS_ETC / "htpasswd.users"
     auth_file.touch(exist_ok=True)
     run(["chown", "root:www-data", str(auth_file)])

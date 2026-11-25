@@ -2,7 +2,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.manage import DeploymentError, render_nginx, ubuntu_version_supported, validate_env
+from scripts.manage import (
+    DeploymentError,
+    remove_config_directives,
+    render_nginx,
+    set_config_directives,
+    ubuntu_version_supported,
+    validate_env,
+)
 
 
 def valid_test_environment():
@@ -83,6 +90,38 @@ class NginxRenderingTests(unittest.TestCase):
         self.assertIn("proxy_pass http://127.0.0.1:8080/nagios/;", rendered)
         self.assertNotIn("return 301 https://", rendered)
         self.assertNotIn("listen 443", rendered)
+
+
+class NagiosConfigTests(unittest.TestCase):
+    def test_cgi_auth_directives_are_removed_from_main_config(self):
+        main_config = (
+            "log_file=/var/log/nagios/nagios.log\n"
+            "use_authentication=1\n"
+            "authorized_for_all_hosts=nagiosadmin\n"
+            "cfg_dir=/usr/local/nagios/etc/servers\n"
+        )
+
+        updated = remove_config_directives(
+            main_config,
+            ("use_authentication", "authorized_for_all_hosts"),
+        )
+
+        self.assertNotIn("use_authentication=", updated)
+        self.assertNotIn("authorized_for_all_hosts=", updated)
+        self.assertIn("log_file=/var/log/nagios/nagios.log", updated)
+        self.assertIn("cfg_dir=/usr/local/nagios/etc/servers", updated)
+
+    def test_cgi_auth_directives_are_written_to_cgi_config(self):
+        cgi_config = "use_authentication=0\nauthorized_for_all_hosts=*\n"
+
+        updated = set_config_directives(
+            cgi_config,
+            {"use_authentication": "1", "authorized_for_all_hosts": "nagiosadmin"},
+        )
+
+        self.assertIn("use_authentication=1", updated)
+        self.assertIn("authorized_for_all_hosts=nagiosadmin", updated)
+        self.assertEqual(updated.count("use_authentication="), 1)
 
 
 if __name__ == "__main__":

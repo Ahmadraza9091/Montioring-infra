@@ -226,6 +226,8 @@ For production, use real DNS hostnames; `.test` hostnames are only for private t
 
 ### Nagios configuration failure
 
+If validation reports `UNKNOWN VARIABLE` for `use_authentication` or an `authorized_for_*` setting, these are CGI directives and belong in `cgi.cfg`, not `nagios.cfg`. The Python configurator removes misplaced entries and writes them to the correct file; run `sudo make configure-nagios` after updating the project.
+
 ```bash
 sudo /usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
 sudo journalctl -u nagios.service -n 200 --no-pager
