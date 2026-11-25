@@ -12,46 +12,103 @@ This project deploys TBCOps with PostgreSQL in Docker and Nagios Core natively o
 
 PostgreSQL data is stored in the `opsknight_postgres_data` Docker volume.
 
+## Project files: what each one does
+
+- `.env.example` is the configuration template. Copy it to `.env`; put server-specific domains and secrets in `.env`, never in the template.
+- `.env` is read by the Python runner and Docker Compose. It contains passwords and application keys, is restricted to owner access, and is excluded from Git.
+- `Makefile` provides short commands such as `make up`, `make health`, and `make backup`. Each target calls the Python deployment runner.
+- `scripts/manage.py` is the Python orchestration entry point. It validates `.env`, installs Ubuntu packages and Docker, builds Nagios, writes Nginx/Apache configuration, manages containers, runs health checks, and handles backup/restore.
+- `docker-compose.yml` runs TBCOps and PostgreSQL. Both container ports are bound to `127.0.0.1`; Nginx is the public HTTP/HTTPS entry point. PostgreSQL data persists in a named Docker volume.
+- `templates/opsknight.nginx.conf.template` and `templates/nagios.nginx.conf.template` are rendered into Nginx sites for the app and Nagios.
+- `templates/nagios-apache.conf.template` configures Apache's private Nagios CGI endpoint.
+- `configs/nagios/local.cfg` is the example Nagios host/service monitoring configuration.
+- `tests/test_manage.py` checks Python configuration, Ubuntu version gating, and private HTTP Nginx rendering. Run it with `python3 -m unittest discover -s tests -v`.
+- `backups/` contains only a placeholder in the repository. Real backups are written to `BACKUP_DIR` from `.env` (default: `/opt/backups/opsknight-monitoring`).
+- `.gitignore` keeps `.env`, backups, build scratch, and Python bytecode out of version control.
+- `readme.md` is this full deployment reference. `readme-fresh-server.md` gives the fresh-server, private testing, and ngrok walkthrough.
+
+The `opsknight-*` Compose, volume, file, and `OPSKNIGHT_*` environment names are retained as technical compatibility identifiers. Keep those names unchanged even though the product branding in the documentation is TBCOps.
+
 ## Prerequisites
 
-- A fresh Ubuntu 22.04+ server release that is still supported by Ubuntu and available in Docker's package repository
-- DNS A records for the two domains, each pointing to the server public IPv4 address
-- SSH access retained as a separate fallback session
-- A monitored address for `CERTBOT_EMAIL`
-- Root or sudo access
+- Ubuntu 22.04 or newer, on a release still supported by Ubuntu and available in Docker's package repository. The installer uses the release codename for Docker's apt repository.
+- A sudo-capable account and SSH access. Keep a second SSH session open while setup changes firewall rules.
+- Working internet access to Ubuntu, Docker, Nagios, GitHub, and the configured container image registry.
+- For production HTTPS only: two DNS A records pointing to this server and a monitored certificate email.
+- For private testing: no public DNS is required; use `.test` hostnames and resolve them from the client computer.
+- For Proxmox: a VM is the simplest Docker host. Docker inside an LXC may require nesting/keyctl and suitable container permissions; ensure the CT has a reachable bridged/LAN IP.
 
-Ports 22, 80, and 443 must remain reachable. Docker group membership is not enabled by this project because it grants root-equivalent privileges.
+Ports 22, 80, and 443 must be reachable as appropriate for your network. Docker group membership is not enabled because it grants root-equivalent privileges. Do not expose the HTTP-only test setup to the public internet.
 
 ## Configuration
 
-Copy and edit the environment file:
+Create a private `.env` from the template:
 
 ```bash
 cp .env.example .env
 chmod 600 .env
+```
+
+Generate strong random secrets immediately after copying the template. The commands below replace the `CHANGE_ME` values with random hexadecimal values:
+
+```bash
+sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 32)|" .env
+sed -i "s|^API_KEY_SECRET=.*|API_KEY_SECRET=$(openssl rand -hex 32)|" .env
+sed -i "s|^NEXTAUTH_SECRET=.*|NEXTAUTH_SECRET=$(openssl rand -hex 32)|" .env
+sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=$(openssl rand -hex 32)|" .env
+sed -i "s|^NAGIOS_ADMIN_PASSWORD=.*|NAGIOS_ADMIN_PASSWORD=$(openssl rand -hex 32)|" .env
+sed -i "s|^PROMETHEUS_SCRAPE_TOKEN=.*|PROMETHEUS_SCRAPE_TOKEN=$(openssl rand -hex 32)|" .env
+```
+
+`PROMETHEUS_SCRAPE_TOKEN` is optional; generate it only if you use that integration. These are one-time Linux shell commands for preparing `.env`; deployment and management scripts themselves are Python. The runner also generates its required secrets automatically if `.env` does not exist, but it does not overwrite or repair an existing `.env`.
+
+Now edit the hostnames and URLs:
+
+```bash
 nano .env
 ```
 
-`make check` creates `.env` with generated secrets only when it does not already exist. Set at least:
+Choose **one** configuration mode:
 
-- `OPSKNIGHT_DOMAIN`
-- `NAGIOS_DOMAIN`
-- `OPSKNIGHT_PUBLIC_URL=https://<tbcops-domain>`
-- `NEXTAUTH_URL=https://<tbcops-domain>`
-- `POSTGRES_PASSWORD`
-- `API_KEY_SECRET`
-- `NEXTAUTH_SECRET`
-- `ENCRYPTION_KEY`
-- `NAGIOS_ADMIN_PASSWORD`
-- `CERTBOT_EMAIL`
-- `NAGIOS_VERSION`
-- `NAGIOS_PLUGINS_VERSION`
+**Private/LAN testing without a domain** (HTTP only):
 
-Do not commit `.env` or backup output.
+```dotenv
+OPSKNIGHT_DOMAIN=tbcops.test
+NAGIOS_DOMAIN=nagios.test
+OPSKNIGHT_PUBLIC_URL=http://tbcops.test
+NEXTAUTH_URL=http://tbcops.test
+NGINX_ENABLE_SSL=false
+```
+
+**Production with your own DNS names** (HTTPS):
+
+```dotenv
+OPSKNIGHT_DOMAIN=tbcops.yourdomain.net
+NAGIOS_DOMAIN=nagios.yourdomain.net
+OPSKNIGHT_PUBLIC_URL=https://tbcops.yourdomain.net
+NEXTAUTH_URL=https://tbcops.yourdomain.net
+NGINX_ENABLE_SSL=true
+CERTBOT_EMAIL=you@example.net
+ADMIN_EMAIL=you@example.net
+```
+
+Replace `yourdomain.net` and the email placeholders with real values. Point both A records to the server before running `make up`; the SSL step checks DNS and requests both certificates. For private testing, keep the `.test` names distinct and do not request certificates.
+
+Other useful `.env` settings:
+
+- `OPSKNIGHT_IMAGE`: application image/tag to deploy.
+- `POSTGRES_USER`, `POSTGRES_DB`, `POSTGRES_PORT`, `APP_PORT`: database identity and loopback ports. Do not change database identity after creating a database without a migration plan.
+- `NAGIOS_VERSION`, `NAGIOS_PLUGINS_VERSION`: versions downloaded and compiled during installation. SHA-256 fields are optional; setting them enables independent checksum verification.
+- `NAGIOS_ADMIN_USER`, `NAGIOS_ADMIN_PASSWORD`: Nagios web login.
+- `FIREWALL_ENABLE` and `ALLOW_*_PORT`: whether the installer configures UFW and which ports it allows. Also check Proxmox/network firewall rules.
+- `BACKUP_DIR`, `BACKUP_RETENTION_DAYS`: backup location and automatic retention period.
+- `PROMETHEUS_SCRAPE_TOKEN`: optional; leave blank if that integration is unused.
+
+Do not post or commit `.env`, and do not reuse the sample `CHANGE_ME` values. If an `ENCRYPTION_KEY` has already protected stored data, do not rotate it unless the application supports re-encryption. Changing `POSTGRES_PASSWORD` after PostgreSQL initialized also requires changing the password inside PostgreSQL; changing `.env` alone does not rotate an existing database password.
 
 For compatibility, keep the existing `OPSKNIGHT_*` environment variable names and Compose identifiers such as `opsknight-app` unchanged; TBCOps is the product branding.
 
-For private testing without public DNS, use distinct local-only hostnames such as `tbcops.test` and `nagios.test`, set both app URLs to `http://tbcops.test`, and set `NGINX_ENABLE_SSL=false`. This mode is HTTP-only; keep it on a private network and do not expose it publicly. See [readme-fresh-server.md](./readme-fresh-server.md) for the full no-domain and ngrok instructions.
+For detailed hosts-file and Proxmox networking instructions for private testing, see [readme-fresh-server.md](./readme-fresh-server.md).
 
 ## DNS
 
@@ -66,27 +123,56 @@ The SSL configuration step stops with a clear error if either record is missing 
 
 ## Fresh installation
 
-The server automation is implemented in Python and requires no pip packages. Configure `.env` once, then run this single command from an SSH session:
+### From a new Ubuntu server
+
+Connect over SSH and install the small bootstrap tools needed to clone and run this project:
 
 ```bash
-sudo make up
+sudo apt-get update
+sudo apt-get install -y git make python3 openssl
+git clone <YOUR_REPOSITORY_URL> tbcops-monitoring
+cd tbcops-monitoring
 ```
 
-`make up` validates the environment, installs dependencies and Docker, installs Nagios Core and plugins, configures Nginx and SSL, and starts the containers. `make setup` remains available as a backward-compatible alias.
+Replace `<YOUR_REPOSITORY_URL>` with your repository's clone URL. Follow the [Configuration](#configuration) section to create `.env`, generate secrets, and choose private-test or production settings. Do not copy real secrets into this README or share them in terminal screenshots.
 
-To perform setup in stages:
+The server automation is Python and uses only the standard library; no `pip install` is needed. Validate the settings, then run the full installation:
 
 ```bash
 sudo make check
-sudo make install-dependencies
-sudo make install-docker
-sudo make install-nagios
-sudo make configure-nginx
-sudo make configure-ssl
-sudo make deploy
+sudo make up
 ```
 
-The setup may take several minutes while Nagios is compiled. If a step fails, Python reports the failed command and stops without continuing to later setup stages.
+If `make check` created `.env` automatically, it generated secrets but still requires you to set the correct hostnames/URLs before it will pass validation.
+
+### What `make up` does
+
+`make up` performs these stages in order and stops with the failed command if a stage errors:
+
+1. Validates Ubuntu, `.env`, and available prerequisites.
+2. Installs build tools, Apache, Nginx, Certbot, and firewall rules.
+3. Installs Docker Engine and Compose.
+4. Downloads and compiles Nagios Core and plugins, configures its CGI authentication, and validates Nagios/Apache.
+5. Renders Nginx sites and validates the Nginx configuration.
+6. If SSL is enabled, verifies DNS, obtains certificates, tests renewal, and enables HTTPS. If SSL is disabled, it skips Certbot.
+7. Pulls and starts TBCOps and PostgreSQL, then waits for their health checks.
+
+The first install takes several minutes while Nagios is compiled. `make setup` is a backward-compatible alias for `make up`. If a step fails, correct the reported cause and run the relevant `make` target rather than repeating completed installation stages unnecessarily.
+
+After setup, verify the services:
+
+```bash
+sudo make status
+sudo make health
+```
+
+For HTTP-only private testing, add the hostnames to the client computer's hosts file, pointing them to the server's private IP:
+
+```text
+<SERVER_LAN_IP> tbcops.test nagios.test
+```
+
+On Windows edit `C:\Windows\System32\drivers\etc\hosts` as Administrator; Linux/macOS use `/etc/hosts`. Then visit `http://tbcops.test` and `http://nagios.test/nagios/`. Typing only the IP does not select the correct Nginx virtual host. From inside the server, `127.0.0.1:3001` and `127.0.0.1:8080` are local-only checks; from another computer, `127.0.0.1` means that computer, not the server.
 
 ## Login
 

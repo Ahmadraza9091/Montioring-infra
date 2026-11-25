@@ -31,10 +31,31 @@ Create the private environment file and edit it before installing:
 ```bash
 cp .env.example .env
 chmod 600 .env
-nano .env
 ```
 
-`make check` also creates `.env` and generates fresh secrets if the file is absent. It does not choose hostnames or replace all example values for you. Keep `.env` private and do not commit it.
+Replace the sample secrets before first deployment:
+
+```bash
+sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 32)|" .env
+sed -i "s|^API_KEY_SECRET=.*|API_KEY_SECRET=$(openssl rand -hex 32)|" .env
+sed -i "s|^NEXTAUTH_SECRET=.*|NEXTAUTH_SECRET=$(openssl rand -hex 32)|" .env
+sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=$(openssl rand -hex 32)|" .env
+sed -i "s|^NAGIOS_ADMIN_PASSWORD=.*|NAGIOS_ADMIN_PASSWORD=$(openssl rand -hex 32)|" .env
+```
+
+Optionally generate a token if you use Prometheus scraping:
+
+```bash
+sed -i "s|^PROMETHEUS_SCRAPE_TOKEN=.*|PROMETHEUS_SCRAPE_TOKEN=$(openssl rand -hex 32)|" .env
+```
+
+`make check` creates `.env` with fresh secrets only if `.env` does not already exist. Since this guide copies the template first, you must replace its `CHANGE_ME` values as shown above. Keep `.env` private and do not commit or share it.
+
+Now edit the domains/URLs and select the HTTP test configuration or HTTPS production configuration shown below:
+
+```bash
+nano .env
+```
 
 At minimum, check these values:
 
@@ -46,7 +67,7 @@ At minimum, check these values:
 
 The product branding is TBCOps, but keep the existing `OPSKNIGHT_*` environment variable names unchanged; deployment scripts use them as compatibility identifiers.
 
-You can generate random secret values with `openssl rand -hex 32`. Do not change `ENCRYPTION_KEY` after storing encrypted application data unless the application supports re-encryption.
+Do not change `ENCRYPTION_KEY` after storing encrypted application data unless the application supports re-encryption. Changing `POSTGRES_PASSWORD` after PostgreSQL has initialized also requires updating the database user's password inside PostgreSQL.
 
 ## Private test without buying a domain
 
