@@ -1,0 +1,20 @@
+Alias /nagios "/usr/local/nagios/share"
+ScriptAlias /nagios/cgi-bin "/usr/local/nagios/sbin"
+
+<Directory "/usr/local/nagios/share">
+    Options None
+    AllowOverride None
+    AuthName "Nagios Access"
+    AuthType Basic
+    AuthUserFile /usr/local/nagios/etc/htpasswd.users
+    Require valid-user
+</Directory>
+
+<Directory "/usr/local/nagios/sbin">
+    Options ExecCGI
+    AllowOverride None
+    AuthName "Nagios Access"
+    AuthType Basic
+    AuthUserFile /usr/local/nagios/etc/htpasswd.users
+    Require valid-user
+</Directory>

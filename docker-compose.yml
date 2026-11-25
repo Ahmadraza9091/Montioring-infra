@@ -1,0 +1,66 @@
+services:
+  opsknight-db:
+    image: postgres:15-alpine
+    container_name: opsknight-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set database user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set database password}
+      POSTGRES_DB: ${POSTGRES_DB:?Set database name}
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - opsknight_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [proxmox-net]
+
+  opsknight-app:
+    image: ${OPSKNIGHT_IMAGE:-haideralimazari/tbc-ops:1.0.0}
+    container_name: opsknight-app
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${APP_PORT:-3001}:3000"
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=512}
+      API_KEY_SECRET: ${API_KEY_SECRET:?Set API_KEY_SECRET}
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD_URLENCODED:?Set encoded database password}@opsknight-db:5432/${POSTGRES_DB}?sslmode=prefer&connection_limit=10&pool_timeout=10"
+      NEXTAUTH_URL: ${NEXTAUTH_URL:?Set NEXTAUTH_URL}
+      NEXT_PUBLIC_APP_URL: ${OPSKNIGHT_PUBLIC_URL:?Set public HTTPS URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Set NEXTAUTH_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
+      NOTIFICATION_CONTROL_PLANE_PERSONAL: ${NOTIFICATION_CONTROL_PLANE_PERSONAL:-true}
+      PROMETHEUS_SCRAPE_TOKEN: ${PROMETHEUS_SCRAPE_TOKEN:-}
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+      NEXT_TELEMETRY_DISABLED: "1"
+    depends_on:
+      opsknight-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:3000/api/health?mode=readiness', r => { let data=''; r.on('data', c => data += c); r.on('end', () => { try { const res = JSON.parse(data); process.exit(res.status === 'healthy' ? 0 : 1); } catch(e) { process.exit(1); } }); }).on('error', () => process.exit(1));"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks: [proxmox-net]
+
+networks:
+  proxmox-net:
+    driver: bridge
+
+volumes:
+  opsknight_postgres_data:
