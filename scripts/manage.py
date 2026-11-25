@@ -271,13 +271,22 @@ def ubuntu_release() -> dict[str, str]:
     return release
 
 
+def ubuntu_version_supported(version_id: str) -> bool:
+    match = re.fullmatch(r"(\d+)\.(\d+)", version_id)
+    if not match:
+        return False
+    return tuple(map(int, match.groups())) >= (22, 4)
+
+
 def check_prerequisites() -> None:
     values = ready_env()
     if platform.system() != "Linux":
         die("Deployment scripts require Linux; Windows is supported only for editing and static checks.")
     release = ubuntu_release()
-    if release.get("ID") != "ubuntu" or release.get("VERSION_ID") not in {"22.04", "24.04"}:
-        die(f"Only Ubuntu 22.04 or 24.04 is supported (detected: {release.get('PRETTY_NAME', 'unknown')}).")
+    if release.get("ID") != "ubuntu":
+        die(f"Ubuntu is required (detected: {release.get('PRETTY_NAME', 'unknown')}).")
+    if not ubuntu_version_supported(release.get("VERSION_ID", "")):
+        die(f"Ubuntu 22.04 or newer is required (detected: {release.get('PRETTY_NAME', 'unknown')}).")
     for name in ("python3",):
         require_command(name)
     if shutil.which("docker"):

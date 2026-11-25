@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.manage import DeploymentError, render_nginx, validate_env
+from scripts.manage import DeploymentError, render_nginx, ubuntu_version_supported, validate_env
 
 
 def valid_test_environment():
@@ -45,6 +45,16 @@ class EnvironmentValidationTests(unittest.TestCase):
         values["NGINX_ENABLE_SSL"] = "true"
         with self.assertRaises(DeploymentError):
             validate_env(values)
+
+    def test_ubuntu_versions_22_04_and_newer_are_allowed(self):
+        for version in ("22.04", "22.10", "24.04", "26.04"):
+            with self.subTest(version=version):
+                self.assertTrue(ubuntu_version_supported(version))
+
+    def test_ubuntu_versions_older_than_22_04_are_rejected(self):
+        for version in ("20.04", "21.10", "not-a-version"):
+            with self.subTest(version=version):
+                self.assertFalse(ubuntu_version_supported(version))
 
 
 class NginxRenderingTests(unittest.TestCase):

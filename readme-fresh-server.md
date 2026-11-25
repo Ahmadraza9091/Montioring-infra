@@ -4,7 +4,7 @@ This guide covers a new Ubuntu server, private testing without owning a domain, 
 
 ## What you need
 
-- A clean Ubuntu 22.04 or 24.04 server (the deployment scripts do not support Windows).
+- A clean Ubuntu 22.04 or newer server release that is still supported by Ubuntu and available in Docker's package repository (the deployment scripts do not support Windows).
 - SSH access with a sudo-capable account.
 - For a production deployment: two DNS A records pointing to the server's public IPv4 address and an email address for certificate notices.
 - For private testing: no public DNS is required, but the client browser must resolve the two test hostnames to the server.

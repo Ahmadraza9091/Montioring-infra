@@ -1,6 +1,6 @@
 # Automated TBCOps + Nagios Deployment
 
-This project deploys TBCOps with PostgreSQL in Docker and Nagios Core natively on an Ubuntu 22.04 or 24.04 server. Nginx owns public ports 80/443 and proxies TBCOps and Nagios; Apache listens only on `127.0.0.1:8080`.
+This project deploys TBCOps with PostgreSQL in Docker and Nagios Core natively on Ubuntu 22.04 or newer. Nginx owns public ports 80/443 and proxies TBCOps and Nagios; Apache listens only on `127.0.0.1:8080`.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ PostgreSQL data is stored in the `opsknight_postgres_data` Docker volume.
 
 ## Prerequisites
 
-- A fresh supported Ubuntu 22.04 or 24.04 server
+- A fresh Ubuntu 22.04+ server release that is still supported by Ubuntu and available in Docker's package repository
 - DNS A records for the two domains, each pointing to the server public IPv4 address
 - SSH access retained as a separate fallback session
 - A monitored address for `CERTBOT_EMAIL`
