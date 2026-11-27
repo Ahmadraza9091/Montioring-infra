@@ -1,0 +1,55 @@
+---
+- name: Validate NRPE configuration
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import pathlib
+        import re
+        import sys
+        main, local = map(pathlib.Path, sys.argv[1:3])
+        text = main.read_text() + "\n" + local.read_text()
+        expected_port = sys.argv[3]
+        required = (
+            r"(?m)^allowed_hosts=\S+$",
+            rf"(?m)^server_port={expected_port}$",
+            r"(?m)^dont_blame_nrpe=[01]$",
+            r"(?m)^allow_bash_command_substitution=0$",
+        )
+        if not all(re.search(pattern, text) for pattern in required):
+            raise SystemExit("NRPE configuration is missing allowed_hosts or the configured server_port")
+        known_directives = {
+            "log_facility", "server_port", "nrpe_user", "nrpe_group", "allowed_hosts",
+            "dont_blame_nrpe", "allow_bash_command_substitution", "debug",
+            "command_timeout", "connection_timeout", "include", "include_dir",
+        }
+        command_names = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            command = re.fullmatch(r"command\[([A-Za-z0-9_]+)\]=\s*(\S.*)", line)
+            if command:
+                if command.group(1) in command_names:
+                    raise SystemExit("NRPE configuration contains a duplicate command")
+                command_names.add(command.group(1))
+                continue
+            directive = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(\S.*)", line)
+            if not directive or directive.group(1) not in known_directives:
+                raise SystemExit("NRPE configuration contains an invalid directive")
+        if len(command_names) == 0:
+            raise SystemExit("NRPE configuration contains no commands")
+      - "{{ nrpe_config_path }}"
+      - "{{ nrpe_local_config }}"
+      - "{{ nrpe_port | string }}"
+  changed_when: false
+  listen: restart nrpe
+  when: not ansible_check_mode
+
+- name: Restart NRPE
+  ansible.builtin.service:
+    name: "{{ nrpe_service_name }}"
+    state: restarted
+  listen: restart nrpe
+  when: not ansible_check_mode

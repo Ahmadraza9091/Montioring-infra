@@ -1,9 +1,16 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.manage import (
     DeploymentError,
+    add_client,
+    append_inventory_host,
+    canonical_client_address,
+    inventory_hosts,
+    valid_client_address,
     remove_config_directives,
     render_nginx,
     set_config_directives,
@@ -62,6 +69,74 @@ class EnvironmentValidationTests(unittest.TestCase):
         for version in ("20.04", "21.10", "not-a-version"):
             with self.subTest(version=version):
                 self.assertFalse(ubuntu_version_supported(version))
+
+    def test_optional_ansible_settings_are_validated(self):
+        values = valid_test_environment()
+        values["NRPE_PORT"] = "5666"
+        values["NRPE_VERSION"] = "4.1.3"
+        values["NAGIOS_SERVER_IP"] = "10.0.0.10"
+        values["ANSIBLE_USER"] = "ubuntu"
+        values["NRPE_CLIENT_SERVICES"] = "nginx,sshd"
+        validate_env(values)
+
+    def test_invalid_ansible_service_name_is_rejected(self):
+        values = valid_test_environment()
+        values["NRPE_CLIENT_SERVICES"] = "nginx; touch /tmp/pwned"
+        with self.assertRaises(DeploymentError):
+            validate_env(values)
+
+    def test_nagios_server_must_be_an_ip_address(self):
+        values = valid_test_environment()
+        values["NAGIOS_SERVER_IP"] = "nagios.internal"
+        with self.assertRaises(DeploymentError):
+            validate_env(values)
+
+
+class AnsibleInventoryTests(unittest.TestCase):
+    def test_client_address_accepts_ip_and_hostname_but_not_shell_syntax(self):
+        for value in ("192.0.2.10", "2001:db8::10", "web01.internal"):
+            with self.subTest(value=value):
+                self.assertTrue(valid_client_address(value))
+        for value in ("", "web01;id", "bad..host", "not a host"):
+            with self.subTest(value=value):
+                self.assertFalse(valid_client_address(value))
+
+    def test_ip_address_canonicalization_detects_equivalent_ipv6_forms(self):
+        self.assertEqual(
+            canonical_client_address("2001:0db8:0:0::10"),
+            canonical_client_address("2001:db8::10"),
+        )
+
+    def test_inventory_insert_preserves_group_vars_and_parses_quoted_path(self):
+        content = "[nrpe_clients]\n\n[nrpe_clients:vars]\nansible_user=ubuntu\n"
+        updated = append_inventory_host(
+            content,
+            "web01 ansible_host=192.0.2.10 ansible_ssh_private_key_file='/tmp/ssh key'",
+        )
+
+        self.assertIn("web01 ansible_host=192.0.2.10", updated)
+        self.assertLess(updated.index("web01"), updated.index("[nrpe_clients:vars]"))
+        self.assertEqual(
+            inventory_hosts(updated),
+            [("web01", {"ansible_host": "192.0.2.10", "ansible_ssh_private_key_file": "/tmp/ssh key"})],
+        )
+
+    def test_add_client_writes_validated_entry_and_rejects_duplicate_address(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = Path(directory) / "hosts.ini"
+            values = {
+                "ANSIBLE_INVENTORY": str(inventory),
+                "ANSIBLE_SSH_KEY_PATH": str(Path(directory) / "private key"),
+                "ANSIBLE_USER": "ubuntu",
+            }
+            with patch.dict(
+                os.environ,
+                {"IP": "192.0.2.10", "NAME": "web01", "CLIENT_USER": "ubuntu"},
+            ):
+                add_client(values)
+                self.assertEqual(inventory_hosts(inventory.read_text(encoding="utf-8"))[0][0], "web01")
+                with self.assertRaises(DeploymentError):
+                    add_client({**values, "ANSIBLE_USER": "deploy"})
 
 
 class NginxRenderingTests(unittest.TestCase):

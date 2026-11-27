@@ -1,0 +1,22 @@
+command[check_load]={{ nrpe_plugin_dir }}/check_load -w {{ nrpe_load_warning }} -c {{ nrpe_load_critical }}
+command[check_disk]={{ nrpe_plugin_dir }}/check_disk -w {{ nrpe_disk_warning }}% -c {{ nrpe_disk_critical }}% -p /
+command[check_disk_var]={{ nrpe_plugin_dir }}/check_disk -w {{ nrpe_disk_warning }}% -c {{ nrpe_disk_critical }}% -p /var
+command[check_users]={{ nrpe_plugin_dir }}/check_users -w 5 -c 10
+command[check_total_procs]={{ nrpe_plugin_dir }}/check_procs -w 250 -c 400
+command[check_zombie_procs]={{ nrpe_plugin_dir }}/check_procs -w 5 -c 10 -s Z
+command[check_swap]={{ nrpe_plugin_dir }}/check_swap -w 20% -c 10%
+command[check_mem]={{ nrpe_mem_script }} {{ nrpe_mem_warning }} {{ nrpe_mem_critical }}
+command[check_ssh]={{ nrpe_plugin_dir }}/check_ssh localhost
+command[check_nrpe_version]={{ nrpe_binary_path }} -V
+{% if nrpe_allow_command_arguments | default(false) | bool %}
+command[check_systemd_service]={{ nrpe_service_check_script }} $ARG1$
+{% endif %}
+{% for service_check in nrpe_detected_service_checks | default([]) %}
+command[{{ service_check.command }}]={{ nrpe_service_check_script }} {{ service_check.unit }}
+{% endfor %}
+{% for check_name, check_command in (nrpe_custom_checks | default({})).items() %}
+command[{{ check_name }}]={{ check_command }}
+{% endfor %}
+{% if ansible_facts.services is defined and ('chronyd.service' in ansible_facts.services or 'chrony.service' in ansible_facts.services or 'ntpd.service' in ansible_facts.services) %}
+command[check_ntp]={{ nrpe_plugin_dir }}/check_ntp_time -H 127.0.0.1
+{% endif %}

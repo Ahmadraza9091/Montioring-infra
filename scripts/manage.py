@@ -7,10 +7,13 @@ import argparse
 import contextlib
 import getpass
 import hashlib
+import ipaddress
+import json
 import os
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import ssl
@@ -32,13 +35,18 @@ ENV_FILE = Path(os.environ.get("ENV_FILE", ROOT / ".env")).expanduser().absolute
 NAGIOS_ETC = Path("/usr/local/nagios/etc")
 NAGIOS_BIN = Path("/usr/local/nagios/bin/nagios")
 NAGIOS_PLUGINS = Path("/usr/local/nagios/libexec")
+ANSIBLE_DIR = ROOT / "ansible"
+ANSIBLE_VENV = Path("/opt/tbcops-ansible")
+ANSIBLE_BIN = ANSIBLE_VENV / "bin"
 SYSTEM_CONFIG_PATHS = (
     NAGIOS_ETC,
+    NAGIOS_ETC / "servers",
     Path("/etc/apache2/conf-available/nagios.conf"),
     Path("/etc/apache2/ports.conf"),
     Path("/etc/nginx/sites-available/opsknight-monitoring.conf"),
     Path("/etc/nginx/sites-available/nagios-monitoring.conf"),
     Path("/etc/nginx/conf.d/opsknight-connection-map.conf"),
+    ROOT / "ansible",
 )
 ACCEPTED_HTTP_CODES = {200, 301, 302, 401, 403}
 
@@ -167,6 +175,27 @@ def valid_port(value: str) -> bool:
     return value.isdigit() and 0 < int(value) <= 65535
 
 
+def valid_client_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return bool(
+            len(value) <= 253
+            and re.fullmatch(
+                r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*",
+                value,
+            )
+        )
+
+
+def canonical_client_address(value: str) -> str:
+    try:
+        return ipaddress.ip_address(value).compressed.lower()
+    except ValueError:
+        return value.lower()
+
+
 def valid_domain(value: str) -> bool:
     return (
         bool(re.fullmatch(r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}", value))
@@ -226,6 +255,32 @@ def validate_env(values: dict[str, str]) -> None:
         die("BACKUP_RETENTION_DAYS must be a positive integer.")
     if values.get("FIREWALL_ENABLE", "true").lower() not in {"true", "false"}:
         die("FIREWALL_ENABLE must be true or false.")
+    if values.get("ENABLE_ANSIBLE_CLIENTS", "false").lower() not in {"true", "false"}:
+        die("ENABLE_ANSIBLE_CLIENTS must be true or false.")
+    if values.get("ENABLE_ANSIBLE_CLIENTS", "false").lower() == "true" and not values.get("NAGIOS_SERVER_IP"):
+        die("Set NAGIOS_SERVER_IP when ENABLE_ANSIBLE_CLIENTS=true.")
+    if values.get("NRPE_PORT") and not valid_port(values["NRPE_PORT"]):
+        die("NRPE_PORT must be a valid TCP port.")
+    if values.get("NRPE_VERSION") and not re.fullmatch(r"\d+\.\d+\.\d+", values["NRPE_VERSION"]):
+        die("NRPE_VERSION must be a numeric x.y.z version.")
+    if values.get("NAGIOS_SERVER_IP"):
+        try:
+            ipaddress.ip_address(values["NAGIOS_SERVER_IP"])
+        except ValueError:
+            die("NAGIOS_SERVER_IP must be a valid IPv4 or IPv6 address.")
+    if values.get("ANSIBLE_USER") and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*[$]?", values["ANSIBLE_USER"]):
+        die("ANSIBLE_USER contains unsupported characters.")
+    if values.get("ANSIBLE_SSH_KEY_PATH") and re.search(r"[\r\n]", values["ANSIBLE_SSH_KEY_PATH"]):
+        die("ANSIBLE_SSH_KEY_PATH must not contain newlines.")
+    if values.get("ANSIBLE_INVENTORY") and re.search(r"[\r\n]", values["ANSIBLE_INVENTORY"]):
+        die("ANSIBLE_INVENTORY must not contain newlines.")
+    services = [item.strip() for item in values.get("NRPE_CLIENT_SERVICES", "").split(",") if item.strip()]
+    if any(not re.fullmatch(r"[A-Za-z0-9_.@-]+", item) for item in services):
+        die("NRPE_CLIENT_SERVICES must contain comma-separated service names.")
+    if values.get("NAGIOS_NRPE_PLUGIN_SHA256") and not re.fullmatch(
+        r"[0-9a-fA-F]{64}", values["NAGIOS_NRPE_PLUGIN_SHA256"]
+    ):
+        die("NAGIOS_NRPE_PLUGIN_SHA256 must be a 64-character SHA-256.")
     identifier = r"[A-Za-z_][A-Za-z0-9_]*"
     if not re.fullmatch(identifier, values["POSTGRES_USER"]) or not re.fullmatch(identifier, values["POSTGRES_DB"]):
         die("Database user/name must use letters, digits and underscores.")
@@ -237,6 +292,404 @@ def ready_env() -> dict[str, str]:
     values = init_env()
     validate_env(values)
     return values
+
+
+def ansible_inventory_path(values: dict[str, str]) -> Path:
+    configured = Path(values.get("ANSIBLE_INVENTORY") or "ansible/inventory/hosts.ini").expanduser()
+    return configured if configured.is_absolute() else ROOT / configured
+
+
+def ensure_ansible_inventory(values: dict[str, str]) -> Path:
+    inventory = ansible_inventory_path(values)
+    if inventory.is_symlink():
+        die(f"Refusing to use a symlink as the Ansible inventory: {inventory}")
+    if not inventory.exists():
+        example = ANSIBLE_DIR / "inventory" / "hosts.ini.example"
+        if not example.is_file():
+            die(f"Missing Ansible inventory template: {example}")
+        atomic_write(inventory, example.read_text(encoding="utf-8"), 0o640)
+    if not inventory.is_file():
+        die(f"Ansible inventory must be a regular file: {inventory}")
+    return inventory
+
+
+def inventory_hosts(content: str) -> list[tuple[str, dict[str, str]]]:
+    hosts: list[tuple[str, dict[str, str]]] = []
+    in_group = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_group = stripped == "[nrpe_clients]"
+            continue
+        if not in_group:
+            continue
+        try:
+            fields = shlex.split(stripped, comments=True)
+        except ValueError:
+            die("Ansible inventory contains invalid quoting in [nrpe_clients].")
+        if not fields:
+            continue
+        variables: dict[str, str] = {}
+        for field in fields[1:]:
+            if "=" in field:
+                key, value = field.split("=", 1)
+                variables[key] = value
+        hosts.append((fields[0], variables))
+    return hosts
+
+
+def append_inventory_host(content: str, host_line: str) -> str:
+    lines = content.splitlines()
+    group_index = next((index for index, line in enumerate(lines) if line.strip() == "[nrpe_clients]"), None)
+    if group_index is None:
+        die("Ansible inventory is missing the [nrpe_clients] group.")
+    insert_at = len(lines)
+    for index in range(group_index + 1, len(lines)):
+        if lines[index].strip().startswith("["):
+            insert_at = index
+            break
+    lines.insert(insert_at, host_line)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def ssh_key_path(values: dict[str, str]) -> Path:
+    configured = values.get("ANSIBLE_SSH_KEY_PATH") or "~/.ssh/tbcops_ansible"
+    return Path(configured).expanduser().absolute()
+
+
+def ansible_process_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["ANSIBLE_CONFIG"] = str(ANSIBLE_DIR / "ansible.cfg")
+    environment["ANSIBLE_HOST_KEY_CHECKING"] = "True"
+    environment["ANSIBLE_COLLECTIONS_PATHS"] = str(ANSIBLE_VENV / "collections")
+    return environment
+
+
+def ansible_executable(name: str) -> Path:
+    executable = ANSIBLE_BIN / name
+    if not executable.is_file():
+        die(f"Ansible is not installed at {ANSIBLE_VENV}; run make install-ansible first.")
+    return executable
+
+
+def ansible_extra_vars(values: dict[str, str]) -> str:
+    server_ip = values.get("NAGIOS_SERVER_IP", "")
+    if not server_ip:
+        die("Set NAGIOS_SERVER_IP in .env before running Ansible client commands.")
+    return json.dumps(
+        {
+            "nagios_server_ip": server_ip,
+            "nrpe_port": int(values.get("NRPE_PORT") or "5666"),
+            "nrpe_monitored_services": [
+                service.strip()
+                for service in values.get("NRPE_CLIENT_SERVICES", "nginx,docker,sshd").split(",")
+                if service.strip()
+            ],
+            "nagios_check_nrpe_path": str(NAGIOS_PLUGINS / "check_nrpe"),
+            "nagios_nrpe_plugin_version": values.get("NRPE_VERSION") or "4.1.3",
+            "nagios_nrpe_plugin_sha256": values.get("NAGIOS_NRPE_PLUGIN_SHA256", ""),
+            "nagios_delegate_host": "localhost",
+        }
+    )
+
+
+def inventory_host_lines(inventory: Path) -> list[tuple[str, str, int]]:
+    entries: list[tuple[str, str, int]] = []
+    for name, variables in inventory_hosts(inventory.read_text(encoding="utf-8")):
+        address = variables.get("ansible_host", name)
+        raw_port = variables.get("ansible_port", "22")
+        if not valid_client_address(address):
+            die(f"Invalid address for inventory host {name}.")
+        if not valid_port(raw_port):
+            die(f"Invalid SSH port for inventory host {name}.")
+        port = int(raw_port)
+        entries.append((name, address, port))
+    return entries
+
+
+def prepare_known_hosts(inventory: Path, values: dict[str, str]) -> None:
+    known_hosts = Path.home() / ".ssh" / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    hosts = inventory_host_lines(inventory)
+    if not hosts:
+        die("No clients are present in the [nrpe_clients] inventory group.")
+    if known_hosts.is_symlink():
+        die(f"Refusing to use a symlink as known_hosts: {known_hosts}")
+    for _, address, port in hosts:
+        known_host = address if port == 22 else f"[{address}]:{port}"
+        if run(
+            ["ssh-keygen", "-F", known_host, "-f", str(known_hosts)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            continue
+        result = run(
+            ["ssh-keyscan", "-H", "-T", "10", "-p", str(port), address],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode or not result.stdout.strip():
+            die(f"Could not scan SSH host key for {address}:{port}; verify network access and try again.")
+        with known_hosts.open("a", encoding="utf-8") as file:
+            file.write(result.stdout)
+        os.chmod(known_hosts, 0o600)
+
+
+def add_client(values: dict[str, str]) -> None:
+    inventory = ensure_ansible_inventory(values)
+    address = os.environ.get("IP") or input("Client IP or hostname: ").strip()
+    name = os.environ.get("NAME") or input("Inventory name: ").strip()
+    user = os.environ.get("CLIENT_USER") or values.get("ANSIBLE_USER") or input("SSH user: ").strip()
+    if not valid_client_address(address):
+        die("IP must be a valid IPv4/IPv6 address or hostname.")
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}", name):
+        die("NAME must be 1-63 letters, digits, dots, underscores or hyphens.")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*[$]?", user):
+        die("USER contains unsupported characters.")
+    existing = inventory_hosts(inventory.read_text(encoding="utf-8"))
+    normalized_address = canonical_client_address(address)
+    if any(
+        host.lower() == name.lower()
+        or canonical_client_address(vars_.get("ansible_host", host)) == normalized_address
+        for host, vars_ in existing
+    ):
+        die("A client with this name or address is already present in the inventory.")
+    key = str(ssh_key_path(values))
+    host_line = (
+        f"{name} ansible_host={shlex.quote(address)} ansible_user={shlex.quote(user)} "
+        f"ansible_port=22 ansible_ssh_private_key_file={shlex.quote(key)} ansible_become=true"
+    )
+    updated = append_inventory_host(inventory.read_text(encoding="utf-8"), host_line)
+    atomic_write(inventory, updated, 0o640)
+    log(f"Added {name} ({address}) to the Ansible inventory.")
+
+
+def generate_ansible_key(values: dict[str, str]) -> Path:
+    key = ssh_key_path(values)
+    key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if key.parent.name == ".ssh":
+        os.chmod(key.parent, 0o700)
+    if key.is_symlink():
+        die(f"Refusing to use a symlink as the Ansible private key: {key}")
+    if not key.exists():
+        require_command("ssh-keygen")
+        run(
+            ["ssh-keygen", "-t", "ed25519", "-f", str(key), "-N", "", "-C", "tbcops-ansible"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    if not key.is_file() or not Path(f"{key}.pub").is_file():
+        die(f"SSH key generation did not produce both key files at {key}.")
+    os.chmod(key, 0o600)
+    os.chmod(Path(f"{key}.pub"), 0o644)
+    log(f"Ansible SSH key is ready at {key}; key material was not displayed.")
+    return key
+
+
+def install_ansible(values: dict[str, str]) -> None:
+    require_root("install-ansible")
+    require_command("apt-get")
+    require_command("python3")
+    environment = os.environ.copy()
+    environment["DEBIAN_FRONTEND"] = "noninteractive"
+    run(["apt-get", "update"], env=environment)
+    run(
+        ["apt-get", "install", "-y", "python3-venv", "python3-dev", "build-essential", "openssh-client"],
+        env=environment,
+    )
+    ANSIBLE_VENV.parent.mkdir(parents=True, exist_ok=True)
+    if not (ANSIBLE_VENV / "bin" / "python").is_file():
+        run(["python3", "-m", "venv", str(ANSIBLE_VENV)])
+    python = ANSIBLE_BIN / "python"
+    run(
+        [
+            str(python), "-m", "pip", "install",
+            "ansible-core==2.17.13", "ansible-lint==24.12.2", "yamllint==1.35.1",
+        ]
+    )
+    run(
+        [
+            str(ANSIBLE_BIN / "ansible-galaxy"), "collection", "install",
+            "-r", str(ANSIBLE_DIR / "requirements.yml"), "-p", str(ANSIBLE_VENV / "collections"),
+        ],
+        cwd=ANSIBLE_DIR,
+    )
+    log("Pinned Ansible core, lint tools, and collections installed in /opt/tbcops-ansible.")
+
+
+def ansible_copy_key(values: dict[str, str]) -> None:
+    executable = ansible_executable("ansible-playbook")
+    inventory = ensure_ansible_inventory(values)
+    key = generate_ansible_key(values)
+    prepare_known_hosts(inventory, values)
+    public_key = Path(f"{key}.pub")
+    extra_vars = json.dumps(
+        {
+            "ansible_public_key_path": str(public_key),
+            "ansible_remote_user": values.get("ANSIBLE_USER", "root"),
+        }
+    )
+    args = [
+        str(executable),
+        "-i", str(inventory),
+        "playbooks/copy_ssh_key.yml",
+        "--extra-vars", extra_vars,
+    ]
+    if os.environ.get("CI", "").lower() not in {"1", "true", "yes"}:
+        args.extend(["--ask-pass", "--ask-become-pass"])
+    run(args, cwd=ANSIBLE_DIR, env=ansible_process_environment())
+
+
+def run_ansible_playbook(values: dict[str, str], playbook: str, *, check_mode: bool = False) -> None:
+    executable = ansible_executable("ansible-playbook")
+    extra_vars = ansible_extra_vars(values)
+    inventory = ensure_ansible_inventory(values)
+    prepare_known_hosts(inventory, values)
+    args = [
+        str(executable),
+        "-i", str(inventory),
+        playbook,
+        "--extra-vars", extra_vars,
+    ]
+    limit = os.environ.get("LIMIT", "").strip()
+    if limit:
+        if not re.fullmatch(r"[A-Za-z0-9_.,:-]+", limit):
+            die("LIMIT contains unsupported characters.")
+        args.extend(["--limit", limit])
+    if check_mode:
+        args.extend(["--check", "--diff"])
+    if os.environ.get("CI", "").lower() not in {"1", "true", "yes"}:
+        args.append("--ask-become-pass")
+    run(args, cwd=ANSIBLE_DIR, env=ansible_process_environment())
+
+
+def ansible_ping(values: dict[str, str]) -> None:
+    executable = ansible_executable("ansible")
+    inventory = ensure_ansible_inventory(values)
+    prepare_known_hosts(inventory, values)
+    run(
+        [
+            str(executable),
+            "nrpe_clients",
+            "-i", str(inventory),
+            "-m", "ansible.builtin.ping",
+        ],
+        cwd=ANSIBLE_DIR,
+        env=ansible_process_environment(),
+    )
+
+
+def ansible_syntax() -> None:
+    run(
+        [
+            str(ansible_executable("ansible-playbook")),
+            "-i", "inventory/hosts.ini.example",
+            "playbooks/site.yml",
+            "--syntax-check",
+        ],
+        cwd=ANSIBLE_DIR,
+        env=ansible_process_environment(),
+    )
+
+
+def ansible_lint() -> None:
+    run(
+        [str(ansible_executable("ansible-lint")), "--profile", "production", "."],
+        cwd=ANSIBLE_DIR,
+        env=ansible_process_environment(),
+    )
+
+
+def yaml_lint() -> None:
+    executable = ansible_executable("yamllint")
+    run(
+        [str(executable), "-c", str(ROOT / ".yamllint"), "ansible"],
+        cwd=ROOT,
+        env=ansible_process_environment(),
+    )
+
+
+def ansible_verify(values: dict[str, str]) -> None:
+    inventory = ensure_ansible_inventory(values)
+    check_nrpe = NAGIOS_PLUGINS / "check_nrpe"
+    if not check_nrpe.is_file():
+        die(f"check_nrpe is missing at {check_nrpe}; run make ansible-nrpe first.")
+    port = values.get("NRPE_PORT", "5666")
+    failures = 0
+    print(f"{'HOST':<24} {'ADDRESS':<42} RESULT")
+    hosts = inventory_host_lines(inventory)
+    if not hosts:
+        die("No clients are present in the [nrpe_clients] inventory group.")
+    for name, address, _ in hosts:
+        result = run(
+            [str(check_nrpe), "-H", address, "-p", port, "-c", "check_load"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        passed = result.returncode == 0
+        print(f"{name:<24} {address:<42} {'PASS' if passed else 'FAIL'}")
+        if not passed and result.stdout.strip():
+            print(f"  {result.stdout.strip()}")
+        if not passed and result.stderr.strip():
+            print(f"  {result.stderr.strip()}")
+        failures += not passed
+    if failures:
+        die(f"NRPE verification failed for {failures} client(s).")
+    log("NRPE verification passed for all inventory clients.")
+
+
+def remove_client(values: dict[str, str]) -> None:
+    name = os.environ.get("NAME", "").strip()
+    if not name or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}", name):
+        die("Usage: make remove-client NAME=<inventory-name>.")
+    inventory = ensure_ansible_inventory(values)
+    original_inventory = inventory.read_text(encoding="utf-8")
+    hosts = inventory_hosts(original_inventory)
+    if not any(host == name for host, _ in hosts):
+        die(f"No inventory client named {name} was found.")
+    lines = original_inventory.splitlines()
+    output: list[str] = []
+    in_group = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_group = stripped == "[nrpe_clients]"
+        if in_group and stripped and not stripped.startswith(("#", ";")):
+            try:
+                fields = shlex.split(stripped, comments=True)
+            except ValueError:
+                die("Ansible inventory contains invalid quoting in [nrpe_clients].")
+            if fields and fields[0] == name:
+                continue
+        output.append(line)
+    cfg = NAGIOS_ETC / "servers" / "clients" / f"{name}.cfg"
+    report = NAGIOS_ETC / "servers" / "inventory" / f"{name}.yml"
+    for path in (cfg, report):
+        if path.is_symlink():
+            die(f"Refusing to remove a symlink: {path}")
+    if not NAGIOS_BIN.is_file() or not (NAGIOS_ETC / "nagios.cfg").is_file():
+        die("Nagios is not installed on this server; cannot safely validate client removal.")
+    cfg_content = cfg.read_text(encoding="utf-8") if cfg.is_file() else None
+    report_content = report.read_text(encoding="utf-8") if report.is_file() else None
+    atomic_write(inventory, "\n".join(output).rstrip() + "\n", 0o640)
+    for path in (cfg, report):
+        if path.exists():
+            path.unlink()
+    validation = run([str(NAGIOS_BIN), "-v", str(NAGIOS_ETC / "nagios.cfg")], check=False)
+    if validation.returncode:
+        atomic_write(inventory, original_inventory, 0o640)
+        if cfg_content is not None:
+            atomic_write(cfg, cfg_content, 0o640)
+        if report_content is not None:
+            atomic_write(report, report_content, 0o640)
+        die(f"Nagios validation failed; inventory and client files for {name} were restored.")
+    run(["systemctl", "reload", "nagios.service"])
+    log(f"Removed {name} from the inventory and Nagios configuration.")
 
 
 def compose(values: dict[str, str], *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -883,7 +1336,9 @@ def backup(values: dict[str, str]) -> Path:
         shutil.copy2(ENV_FILE, destination / ".env")
         shutil.copy2(ROOT / "docker-compose.yml", destination / "docker-compose.yml")
         with tarfile.open(destination / "project-config.tar.gz", "w:gz") as archive:
-            for item in ("Makefile", "scripts", "templates", "configs/nagios"):
+            for item in ("Makefile", "scripts", "templates", "configs/nagios", "ansible", "docs", ".yamllint", ".ansible-lint"):
+                if not (ROOT / item).exists():
+                    continue
                 archive.add(
                     ROOT / item,
                     arcname=item,
@@ -1043,6 +1498,12 @@ def show_help() -> None:
         "  make install-dependencies       Install Ubuntu dependencies\n"
         "  make install-docker             Install Docker Engine and Compose\n"
         "  make install-nagios             Build and install Nagios\n"
+        "  make install-ansible            Install pinned Ansible and collections\n"
+        "  make add-client IP=... NAME=... USER=...\n"
+        "  make ansible-ssh-key | ansible-copy-key\n"
+        "  make ansible-ping | ansible-nrpe [LIMIT=... CHECK=1]\n"
+        "  make ansible-verify | remove-client NAME=...\n"
+        "  make ansible-syntax | ansible-lint | yamllint\n"
         "  make configure                  Configure Nagios and Nginx\n"
         "  make configure-ssl              Obtain/renew HTTPS certificates\n"
         "  make deploy | update            Deploy or update containers\n"
@@ -1065,6 +1526,9 @@ def command_up() -> None:
     configure_nginx(values)
     configure_ssl(values)
     deploy(ready_env(), "deploy")
+    if values.get("ENABLE_ANSIBLE_CLIENTS", "false").lower() == "true":
+        install_ansible(values)
+        run_ansible_playbook(values, "playbooks/site.yml")
     log("All infrastructure components are installed and running.")
 
 
@@ -1078,6 +1542,9 @@ def main() -> int:
             "deploy", "start", "stop", "restart", "status", "logs", "health", "backup",
             "restore", "update", "rotate-nagios-password", "rotate-opsknight-secrets",
             "rotate-tbcops-secrets",
+            "install-ansible", "ansible-ssh-key", "ansible-copy-key", "add-client",
+            "ansible-ping", "ansible-nrpe", "ansible-verify", "remove-client",
+            "ansible-syntax", "ansible-lint", "yamllint",
             "clean", "up", "setup",
         ),
     )
@@ -1088,6 +1555,15 @@ def main() -> int:
         return 0
     if command == "clean":
         clean()
+        return 0
+    if command == "ansible-syntax":
+        ansible_syntax()
+        return 0
+    if command == "ansible-lint":
+        ansible_lint()
+        return 0
+    if command == "yamllint":
+        yaml_lint()
         return 0
     values = ready_env() if command != "check" else init_env()
     if command == "check":
@@ -1121,6 +1597,26 @@ def main() -> int:
         backup(values)
     elif command == "restore":
         restore(values)
+    elif command == "install-ansible":
+        install_ansible(values)
+    elif command == "ansible-ssh-key":
+        generate_ansible_key(values)
+    elif command == "ansible-copy-key":
+        ansible_copy_key(values)
+    elif command == "add-client":
+        add_client(values)
+    elif command == "ansible-ping":
+        ansible_ping(values)
+    elif command == "ansible-nrpe":
+        run_ansible_playbook(
+            values,
+            "playbooks/site.yml",
+            check_mode=os.environ.get("CHECK", "").lower() in {"1", "true", "yes"},
+        )
+    elif command == "ansible-verify":
+        ansible_verify(values)
+    elif command == "remove-client":
+        remove_client(values)
     elif command == "rotate-nagios-password":
         rotate_password(values, "nagios")
     elif command in {"rotate-opsknight-secrets", "rotate-tbcops-secrets"}:

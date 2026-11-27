@@ -1,0 +1,34 @@
+---
+nrpe_package_debian: nagios-nrpe-server
+nrpe_package_redhat: nrpe
+nrpe_plugins_debian:
+  - monitoring-plugins
+  - monitoring-plugins-basic
+  - monitoring-plugins-standard
+  - monitoring-plugins-common
+  - nagios-nrpe-plugin
+nrpe_plugins_redhat:
+  - nagios-plugins-all
+  - nagios-plugins-nrpe
+nrpe_service_name_debian: nagios-nrpe-server
+nrpe_service_name_redhat: nrpe
+nrpe_user_debian: nagios
+nrpe_group_debian: nagios
+nrpe_user_redhat: nrpe
+nrpe_group_redhat: nrpe
+nrpe_config_path_debian: /etc/nagios/nrpe.cfg
+nrpe_config_path_redhat: /etc/nrpe.cfg
+nrpe_local_config_debian: /etc/nagios/nrpe_local.cfg
+nrpe_local_config_redhat: /etc/nrpe.d/nrpe_local.cfg
+nrpe_mem_script: /usr/local/libexec/check_mem
+nrpe_base_checks:
+  - check_load
+  - check_disk
+  - check_disk_var
+  - check_users
+  - check_total_procs
+  - check_zombie_procs
+  - check_swap
+  - check_mem
+  - check_ssh
+  - check_nrpe_version

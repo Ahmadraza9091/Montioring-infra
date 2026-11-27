@@ -1,0 +1,6 @@
+---
+- name: Install and configure NRPE clients
+  hosts: nrpe_clients
+  become: true
+  roles:
+    - role: nrpe_client

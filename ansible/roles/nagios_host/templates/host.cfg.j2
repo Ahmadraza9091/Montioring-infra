@@ -1,0 +1,17 @@
+define host {
+    use                     linux-server
+    host_name               {{ inventory_hostname }}
+    alias                   {{ inventory_hostname }}
+    address                 {{ ansible_host | default(inventory_hostname) }}
+    hostgroups              nrpe-clients
+}
+
+{% for check in nrpe_detected_checks %}
+define service {
+    use                     local-service
+    host_name               {{ inventory_hostname }}
+    service_description     {{ check | replace('!', ' ') | replace('_', ' ') | title }}
+    check_command           check_nrpe!{{ check }}
+}
+
+{% endfor %}

@@ -1,0 +1,175 @@
+---
+- name: Ensure Nagios client configuration directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: nagios
+    group: nagios
+    mode: '0750'
+  loop:
+    - "{{ nagios_client_cfg_dir }}"
+    - "{{ nagios_inventory_report_dir }}"
+
+- name: Ensure check_nrpe command definition is present
+  ansible.builtin.template:
+    src: commands_nrpe.cfg.j2
+    dest: "{{ nagios_check_nrpe_command_file }}"
+    owner: nagios
+    group: nagios
+    mode: '0640'
+  register: nagios_nrpe_command
+
+- name: Ensure Nagios loads the NRPE command definition
+  ansible.builtin.lineinfile:
+    path: "{{ nagios_etc_dir }}/nagios.cfg"
+    line: "cfg_file={{ nagios_check_nrpe_command_file }}"
+    state: present
+    backup: true
+  register: nagios_nrpe_cfg_include
+
+- name: Install check_nrpe build dependencies
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - curl
+      - libssl-dev
+      - tar
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when:
+    - not (nagios_check_nrpe_path is file)
+
+- name: Build and install pinned check_nrpe plugin when package did not install it
+  ansible.builtin.shell: |
+    set -euo pipefail
+    workdir=$(mktemp -d)
+    trap 'rm -rf "$workdir"' EXIT
+    archive="nrpe-{{ nagios_nrpe_plugin_version }}.tar.gz"
+    curl --fail --location --silent --show-error \
+      "https://github.com/NagiosEnterprises/nrpe/releases/download/nrpe-{{ nagios_nrpe_plugin_version }}/${archive}" \
+      --output "${workdir}/${archive}"
+    {% if nagios_nrpe_plugin_sha256 | length > 0 %}
+    echo "{{ nagios_nrpe_plugin_sha256 }}  ${workdir}/${archive}" | sha256sum --check
+    {% endif %}
+    tar -xzf "${workdir}/${archive}" -C "${workdir}"
+    cd "${workdir}/nrpe-{{ nagios_nrpe_plugin_version }}"
+    ./configure
+    make -C src check_nrpe
+    install -o root -g nagios -m 0755 src/check_nrpe "{{ nagios_check_nrpe_path }}"
+  args:
+    creates: "{{ nagios_check_nrpe_path }}"
+    executable: /bin/bash
+  when: not (nagios_check_nrpe_path is file)
+  register: nagios_check_nrpe_build
+
+- name: Query NRPE version for inventory report
+  ansible.builtin.command:
+    argv:
+      - "{{ nagios_check_nrpe_path }}"
+      - -H
+      - "{{ ansible_host | default(inventory_hostname) }}"
+      - -p
+      - "{{ nrpe_port | string }}"
+      - -c
+      - check_nrpe_version
+  delegate_to: "{{ nagios_delegate_host | default('localhost') }}"
+  changed_when: false
+  register: nrpe_version_output
+  failed_when: false
+
+- name: Render Nagios client host and service configuration
+  ansible.builtin.template:
+    src: host.cfg.j2
+    dest: "{{ nagios_client_cfg_dir }}/{{ inventory_hostname }}.cfg"
+    owner: nagios
+    group: nagios
+    mode: '0640'
+    backup: true
+  register: nagios_client_config
+
+- name: Write client inventory report
+  ansible.builtin.template:
+    src: inventory.yml.j2
+    dest: "{{ nagios_inventory_report_dir }}/{{ inventory_hostname }}.yml"
+    owner: nagios
+    group: nagios
+    mode: '0640'
+  register: nagios_client_report
+
+- name: Validate Nagios configuration before reload
+  ansible.builtin.command:
+    argv:
+      - "{{ nagios_binary }}"
+      - -v
+      - "{{ nagios_etc_dir }}/nagios.cfg"
+  changed_when: false
+  failed_when: false
+  when:
+    - nagios_client_config.changed or nagios_nrpe_command.changed or nagios_nrpe_cfg_include.changed
+  register: nagios_config_validation
+
+- name: Roll back invalid generated host configuration
+  ansible.builtin.copy:
+    src: "{{ nagios_client_config.backup_file }}"
+    dest: "{{ nagios_client_cfg_dir }}/{{ inventory_hostname }}.cfg"
+    remote_src: true
+    owner: nagios
+    group: nagios
+    mode: '0640'
+  when:
+    - nagios_config_validation is not skipped
+    - nagios_config_validation.rc != 0
+    - nagios_client_config.changed
+    - nagios_client_config.backup_file is defined
+
+- name: Remove invalid newly generated host configuration
+  ansible.builtin.file:
+    path: "{{ nagios_client_cfg_dir }}/{{ inventory_hostname }}.cfg"
+    state: absent
+  when:
+    - nagios_config_validation is not skipped
+    - nagios_config_validation.rc != 0
+    - nagios_client_config.changed
+    - nagios_client_config.backup_file is not defined
+
+- name: Fail clearly when Nagios configuration validation fails
+  ansible.builtin.fail:
+    msg: "Nagios configuration validation failed; the generated host config was rolled back. Review the nagios -v output above."
+  when:
+    - nagios_config_validation is not skipped
+    - nagios_config_validation.rc != 0
+
+- name: Remove host config backup after successful validation
+  ansible.builtin.file:
+    path: "{{ nagios_client_config.backup_file }}"
+    state: absent
+  when:
+    - nagios_config_validation is not skipped
+    - nagios_config_validation.rc == 0
+    - nagios_client_config.backup_file is defined
+
+- name: Reload Nagios only when managed configuration changed
+  ansible.builtin.service:
+    name: "{{ nagios_service_name }}"
+    state: reloaded
+  when:
+    - nagios_client_config.changed or nagios_nrpe_command.changed or nagios_nrpe_cfg_include.changed
+
+- name: Remove stale host configuration when explicitly enabled
+  ansible.builtin.find:
+    paths: "{{ nagios_client_cfg_dir }}"
+    patterns: "*.cfg"
+    file_type: file
+  register: nagios_client_cfg_files
+  when: nagios_prune_removed_hosts | bool
+
+- name: Remove host configs no longer present in inventory
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ nagios_client_cfg_files.files | default([]) }}"
+  when:
+    - nagios_prune_removed_hosts | bool
+    - item.path | basename | regex_replace('\\.cfg$', '') not in groups['nrpe_clients']
+  notify: reload nagios

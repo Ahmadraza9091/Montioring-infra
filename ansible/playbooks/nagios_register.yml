@@ -1,0 +1,29 @@
+---
+- name: Register clients in Nagios and collect inventory reports
+  hosts: nrpe_clients
+  gather_facts: true
+  serial: 1
+  tasks:
+    - name: Register each client on the Nagios server
+      ansible.builtin.include_role:
+        name: nagios_host
+        apply:
+          delegate_to: "{{ nagios_delegate_host | default('localhost') }}"
+          become: true
+- name: Print final monitoring summary
+  hosts: nrpe_clients
+  gather_facts: false
+  tasks:
+    - name: Print final monitoring summary table
+      ansible.builtin.debug:
+        msg: |-
+          host | OS | NRPE version | services detected | checks registered
+          {% for client in ansible_play_hosts_all %}
+          {% set facts = hostvars[client] %}
+          {% set os_name = (facts.ansible_distribution | default('unknown')) ~ ' ' ~ (facts.ansible_distribution_version | default('')) %}
+          {% set version = facts.nrpe_version_output.stdout | default('unknown') | trim %}
+          {% set services = facts.nrpe_detected_services | default([]) | join(',') %}
+          {% set checks = facts.nrpe_detected_checks | default([]) | join(',') %}
+          {{ [client, os_name, version, services, checks] | join(' | ') }}
+          {% endfor %}
+      run_once: true

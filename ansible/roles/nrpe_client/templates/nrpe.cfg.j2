@@ -1,0 +1,17 @@
+{% set allow_list = nrpe_allowed_hosts | default(['127.0.0.1', nagios_server_ip]) %}
+log_facility=daemon
+server_port={{ nrpe_port | default(5666) }}
+nrpe_user={{ nrpe_user_debian if ansible_os_family == 'Debian' else nrpe_user_redhat }}
+nrpe_group={{ nrpe_group_debian if ansible_os_family == 'Debian' else nrpe_group_redhat }}
+allowed_hosts={{ allow_list | join(',') }}
+dont_blame_nrpe={{ 1 if nrpe_allow_command_arguments | default(false) | bool else 0 }}
+allow_bash_command_substitution=0
+debug=0
+command_timeout=60
+connection_timeout=300
+{% if ansible_os_family == 'Debian' %}
+include=/etc/nagios/nrpe_local.cfg
+include_dir=/etc/nagios/nrpe.d
+{% else %}
+include_dir=/etc/nrpe.d
+{% endif %}

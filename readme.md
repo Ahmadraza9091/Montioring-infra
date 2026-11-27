@@ -212,6 +212,18 @@ sudo make logs
 
 Health output is PASS/FAIL. Public HTTPS checks validate the certificate chain and hostname.
 
+## Add a monitored client in 3 steps
+
+Configure `NAGIOS_SERVER_IP` and the Ansible settings in `.env`, then run these commands from the Nagios server:
+
+```bash
+sudo make add-client IP=10.0.0.5 NAME=web01 USER=ubuntu
+sudo make ansible-copy-key
+sudo make ansible-nrpe
+```
+
+`ansible-copy-key` prompts for the initial SSH and sudo passwords when needed; neither is saved. The full guide, including verification and removal, is [docs/ANSIBLE_NRPE.md](./docs/ANSIBLE_NRPE.md).
+
 ## Logs
 
 ```bash

@@ -1,0 +1,61 @@
+---
+nagios_server_ip: 127.0.0.1
+nrpe_port: 5666
+nrpe_allowed_hosts:
+  - 127.0.0.1
+  - "{{ nagios_server_ip }}"
+nrpe_plugin_dir: "{{ '/usr/lib/nagios/plugins' if ansible_os_family == 'Debian' else '/usr/lib64/nagios/plugins' }}"
+nrpe_load_warning: 5
+nrpe_load_critical: 10
+nrpe_disk_warning: 20
+nrpe_disk_critical: 10
+nrpe_mem_warning: 20
+nrpe_mem_critical: 10
+nrpe_monitored_services:
+  - nginx
+  - docker
+  - sshd
+nrpe_custom_checks: {}
+nrpe_allow_command_arguments: false
+nrpe_enable_inactive_firewall: false
+nrpe_service_mapping:
+  nginx:
+    packages: [nginx]
+    services: [nginx.service]
+    command: check_service_nginx
+    unit: nginx
+  apache:
+    packages: [apache2, httpd]
+    services: [apache2.service, httpd.service]
+    command: check_service_apache
+    unit: apache2
+  mysql:
+    packages: [mysql-server, mariadb-server]
+    services: [mysql.service, mariadb.service]
+    command: check_service_mysql
+    unit: mysql
+  postgresql:
+    packages: [postgresql]
+    services: [postgresql.service]
+    command: check_service_postgresql
+    unit: postgresql
+  docker:
+    packages: [docker-ce, docker.io, moby-engine]
+    services: [docker.service]
+    command: check_service_docker
+    unit: docker
+  redis:
+    packages: [redis-server, redis]
+    services: [redis-server.service, redis.service]
+    command: check_service_redis
+    unit: redis-server
+  ssh:
+    packages: [openssh-server]
+    services: [ssh.service, sshd.service]
+    command: check_service_ssh
+    unit: sshd
+  cron:
+    packages: [cron, cronie]
+    services: [cron.service, crond.service]
+    command: check_service_cron
+    unit: cron

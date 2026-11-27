@@ -1,0 +1,15 @@
+---
+nagios_etc_dir: /usr/local/nagios/etc
+nagios_servers_dir: /usr/local/nagios/etc/servers
+nagios_client_cfg_dir: /usr/local/nagios/etc/servers/clients
+nagios_inventory_report_dir: /usr/local/nagios/etc/servers/inventory
+nagios_binary: /usr/local/nagios/bin/nagios
+nagios_service_name: nagios.service
+nagios_plugins_dir: /usr/local/nagios/libexec
+nagios_check_nrpe_path: /usr/local/nagios/libexec/check_nrpe
+nagios_nrpe_plugin_version: 4.1.3
+nagios_nrpe_plugin_sha256: ''
+nagios_prune_removed_hosts: false
+nagios_check_nrpe_command_file: /usr/local/nagios/etc/objects/commands_nrpe.cfg
+nrpe_version_output:
+  stdout: unknown

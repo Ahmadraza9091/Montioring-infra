@@ -1,0 +1,24 @@
+---
+- name: Install and configure NRPE clients
+  ansible.builtin.import_playbook: nrpe_client.yml
+- name: Register clients in Nagios
+  ansible.builtin.import_playbook: nagios_register.yml
+- name: Verify NRPE from the Nagios server
+  hosts: nrpe_clients
+  gather_facts: false
+  tasks:
+    - name: Run end-to-end NRPE load check
+      ansible.builtin.command:
+        argv:
+          - "{{ nagios_check_nrpe_path | default('/usr/local/nagios/libexec/check_nrpe') }}"
+          - -H
+          - "{{ ansible_host | default(inventory_hostname) }}"
+          - -p
+          - "{{ nrpe_port | string }}"
+          - -c
+          - check_load
+      delegate_to: "{{ nagios_delegate_host | default('localhost') }}"
+      register: nrpe_e2e_result
+      changed_when: false
+      failed_when: nrpe_e2e_result.rc != 0
+      when: not ansible_check_mode

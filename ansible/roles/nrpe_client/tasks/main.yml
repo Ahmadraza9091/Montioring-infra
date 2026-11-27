@@ -1,0 +1,217 @@
+---
+- name: Validate supported operating system family
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in ['Debian', 'RedHat']
+    fail_msg: "NRPE clients must use Debian/Ubuntu or RHEL/Rocky/Alma."
+
+- name: Validate custom NRPE check names
+  ansible.builtin.assert:
+    that:
+      - item.key is match('^[A-Za-z0-9_]+$')
+      - item.key not in nrpe_base_checks
+      - item.key not in ['check_ntp', 'check_systemd_service']
+      - item.key not in (nrpe_service_mapping | dict2items | map(attribute='value.command') | list)
+    fail_msg: "Custom NRPE command names must be safe and unique."
+  loop: "{{ nrpe_custom_checks | default({}) | dict2items }}"
+
+- name: Gather systemd service facts
+  ansible.builtin.service_facts:
+
+- name: Install EPEL repository on RHEL-family systems
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+  when: ansible_os_family == 'RedHat'
+
+- name: Install NRPE and monitoring plugins on Debian-family systems
+  ansible.builtin.apt:
+    name: "{{ [nrpe_package_debian] + nrpe_plugins_debian }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_os_family == 'Debian'
+
+- name: Install NRPE and monitoring plugins on RHEL-family systems
+  ansible.builtin.dnf:
+    name: "{{ [nrpe_package_redhat] + nrpe_plugins_redhat }}"
+    state: present
+  when: ansible_os_family == 'RedHat'
+
+- name: Set platform-specific NRPE paths
+  ansible.builtin.set_fact:
+    nrpe_service_name: "{{ nrpe_service_name_debian if ansible_os_family == 'Debian' else nrpe_service_name_redhat }}"
+    nrpe_config_path: "{{ nrpe_config_path_debian if ansible_os_family == 'Debian' else nrpe_config_path_redhat }}"
+    nrpe_local_config: "{{ nrpe_local_config_debian if ansible_os_family == 'Debian' else nrpe_local_config_redhat }}"
+    nrpe_binary_path: /usr/sbin/nrpe
+    nrpe_service_check_script: /usr/local/libexec/check_systemd_service
+
+- name: Ensure NRPE include directory exists
+  ansible.builtin.file:
+    path: "{{ '/etc/nagios/nrpe.d' if ansible_os_family == 'Debian' else '/etc/nrpe.d' }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Ensure local Nagios plugin directory exists
+  ansible.builtin.file:
+    path: /usr/local/libexec
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install custom memory check
+  ansible.builtin.copy:
+    dest: "{{ nrpe_mem_script }}"
+    owner: root
+    group: root
+    mode: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
+      warning="${1:-20}"
+      critical="${2:-10}"
+      available=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+      total=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+      percent=$((available * 100 / total))
+      if [ "$percent" -le "$critical" ]; then
+        printf 'CRITICAL - %s%% memory available\n' "$percent"
+        exit 2
+      elif [ "$percent" -le "$warning" ]; then
+        printf 'WARNING - %s%% memory available\n' "$percent"
+        exit 1
+      fi
+      printf 'OK - %s%% memory available\n' "$percent"
+
+- name: Install systemd service check
+  ansible.builtin.copy:
+    dest: "{{ nrpe_service_check_script }}"
+    owner: root
+    group: root
+    mode: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
+      service="${1:?service name required}"
+      case "$service" in
+        *[!A-Za-z0-9_.@-]*|'') printf 'UNKNOWN - invalid service name\n'; exit 3 ;;
+      esac
+      if systemctl is-active --quiet "$service"; then
+        printf 'OK - %s is active\n' "$service"
+      else
+        printf 'CRITICAL - %s is not active\n' "$service"
+        exit 2
+      fi
+
+- name: Install NRPE main configuration
+  ansible.builtin.template:
+    src: nrpe.cfg.j2
+    dest: "{{ nrpe_config_path }}"
+    owner: root
+    group: root
+    mode: '0640'
+  notify: restart nrpe
+
+- name: Gather installed package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Initialize detected monitoring facts
+  ansible.builtin.set_fact:
+    nrpe_detected_services: []
+    nrpe_detected_packages: []
+    nrpe_detected_checks: "{{ nrpe_base_checks }}"
+    nrpe_detected_checks_extra: "{{ nrpe_custom_checks | default({}) | dict2items | map(attribute='key') | list }}"
+    nrpe_detected_service_checks: []
+
+- name: Include configured custom NRPE checks
+  ansible.builtin.set_fact:
+    nrpe_detected_checks: "{{ nrpe_detected_checks + nrpe_detected_checks_extra }}"
+
+- name: Identify installed monitored services and package names
+  ansible.builtin.set_fact:
+    nrpe_detected_services: "{{ nrpe_detected_services + [item.key] }}"
+    nrpe_detected_packages: "{{ nrpe_detected_packages + (item.value.packages | intersect(ansible_facts.packages.keys() | list)) }}"
+    nrpe_detected_checks: "{{ nrpe_detected_checks + [item.value.command] }}"
+    nrpe_detected_service_checks: >-
+      {{ nrpe_detected_service_checks + [{
+        'command': item.value.command,
+        'unit': (
+          item.value.services
+          | intersect(ansible_facts.services.keys() | list)
+          | first
+          | default(item.value.unit)
+          | regex_replace('\\.service$', '')
+        )
+      }] }}
+  loop: "{{ (nrpe_service_mapping | default({})) | dict2items }}"
+  when: >-
+    (item.value.packages | intersect(ansible_facts.packages.keys() | list) | length > 0)
+    or (item.value.services | intersect(ansible_facts.services.keys() | list) | length > 0)
+
+- name: Ensure requested services are represented as NRPE checks
+  ansible.builtin.set_fact:
+    nrpe_detected_checks: "{{ nrpe_detected_checks + [ 'check_service_' + (item | regex_replace('[^A-Za-z0-9_]', '_')) ] }}"
+    nrpe_detected_services: "{{ nrpe_detected_services + ([item] if item not in nrpe_detected_services else []) }}"
+    nrpe_detected_service_checks: >-
+      {{ nrpe_detected_service_checks + [{
+        'command': 'check_service_' + (item | regex_replace('[^A-Za-z0-9_]', '_')),
+        'unit': (item + '.service' if item + '.service' in ansible_facts.services else item)
+      }] }}
+  loop: "{{ nrpe_monitored_services | default([]) }}"
+  when:
+    - item in ansible_facts.services or item + '.service' in ansible_facts.services
+    - "'check_service_' + (item | regex_replace('[^A-Za-z0-9_]', '_')) not in nrpe_detected_checks"
+    - item not in (nrpe_detected_service_checks | map(attribute='unit') | list)
+
+- name: Add NTP check when a time daemon is installed
+  ansible.builtin.set_fact:
+    nrpe_detected_checks: "{{ nrpe_detected_checks + ['check_ntp'] }}"
+  when: >-
+    'chronyd.service' in ansible_facts.services
+    or 'chrony.service' in ansible_facts.services
+    or 'ntpd.service' in ansible_facts.services
+
+- name: Install NRPE local configuration
+  ansible.builtin.template:
+    src: nrpe_local.cfg.j2
+    dest: "{{ nrpe_local_config }}"
+    owner: root
+    group: root
+    mode: '0640'
+  notify: restart nrpe
+
+- name: Apply pending NRPE restart after validating configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Install firewall rule with UFW when active
+  community.general.ufw:
+    rule: allow
+    port: "{{ nrpe_port | string }}"
+    proto: tcp
+    from_ip: "{{ nagios_server_ip }}"
+    comment: NRPE from Nagios server
+  when:
+    - ansible_facts.services['ufw.service'] is defined
+    - ansible_facts.services['ufw.service'].state == 'running'
+
+- name: Install firewall rule with firewalld when active
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="{{ 'ipv6' if ':' in nagios_server_ip else 'ipv4' }}"
+      source address="{{ nagios_server_ip }}"
+      port port="{{ nrpe_port }}" protocol="tcp" accept
+    permanent: true
+    immediate: true
+    state: enabled
+  when:
+    - ansible_facts.services['firewalld.service'] is defined
+    - ansible_facts.services['firewalld.service'].state == 'running'
+
+- name: Enable and start NRPE
+  ansible.builtin.service:
+    name: "{{ nrpe_service_name }}"
+    enabled: true
+    state: started

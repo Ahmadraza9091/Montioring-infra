@@ -1,11 +1,13 @@
 SHELL := /bin/sh
 .DEFAULT_GOAL := help
-.PHONY: help check install-dependencies install-docker install-nagios configure \
+.PHONY: help check install-dependencies install-docker install-nagios install-ansible configure \
 	configure-nginx configure-nagios configure-ssl deploy start stop restart status \
 	logs health backup restore update rotate-opsknight-secrets rotate-nagios-password \
-	clean setup up rotate-tbcops-secrets
+	clean setup up rotate-tbcops-secrets ansible-ssh-key ansible-copy-key add-client \
+	ansible-ping ansible-nrpe ansible-verify remove-client ansible-syntax ansible-lint yamllint
 
-export BACKUP CONFIRM_RESTORE
+export BACKUP CONFIRM_RESTORE IP NAME LIMIT CHECK
+export CLIENT_USER = $(if $(filter command line,$(origin USER)),$(USER),)
 
 help: ## Show available commands
 	python3 scripts/manage.py help
@@ -21,6 +23,39 @@ install-docker: ## Install Docker Engine and Compose from the official repositor
 
 install-nagios: ## Build and install Nagios Core and official plugins
 	python3 scripts/manage.py install-nagios
+
+install-ansible: ## Install pinned Ansible core, lint tools, and collections
+	python3 scripts/manage.py install-ansible
+
+ansible-ssh-key: ## Generate or secure the Ansible SSH key
+	python3 scripts/manage.py ansible-ssh-key
+
+ansible-copy-key: ## Copy the SSH key to inventory clients (interactive password prompts)
+	python3 scripts/manage.py ansible-copy-key
+
+add-client: ## Add a monitored client: make add-client IP=... NAME=... USER=...
+	python3 scripts/manage.py add-client
+
+ansible-ping: ## Ping inventory clients over SSH
+	python3 scripts/manage.py ansible-ping
+
+ansible-nrpe: ## Configure clients and register in Nagios; supports LIMIT= and CHECK=1
+	python3 scripts/manage.py ansible-nrpe
+
+ansible-verify: ## Verify check_nrpe from the Nagios server
+	python3 scripts/manage.py ansible-verify
+
+remove-client: ## Remove a client: make remove-client NAME=...
+	python3 scripts/manage.py remove-client
+
+ansible-syntax: ## Run Ansible playbook syntax-check
+	python3 scripts/manage.py ansible-syntax
+
+ansible-lint: ## Run ansible-lint production profile
+	python3 scripts/manage.py ansible-lint
+
+yamllint: ## Lint Ansible YAML
+	python3 scripts/manage.py yamllint
 
 configure: ## Configure Nagios and Nginx
 	python3 scripts/manage.py configure

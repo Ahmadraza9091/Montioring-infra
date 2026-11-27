@@ -1,0 +1,8 @@
+---
+hostname: {{ inventory_hostname | to_json }}
+address: {{ (ansible_host | default(inventory_hostname)) | to_json }}
+os: {{ (ansible_distribution ~ ' ' ~ ansible_distribution_version) | to_json }}
+nrpe_version: {{ nrpe_version_output.stdout | default('unknown') | to_json }}
+installed_packages: {{ nrpe_detected_packages | default([]) | to_json }}
+detected_services: {{ nrpe_detected_services | default([]) | to_json }}
+checks_registered: {{ nrpe_detected_checks | default([]) | to_json }}

@@ -1,0 +1,15 @@
+---
+- name: Validate Nagios configuration
+  ansible.builtin.command:
+    argv:
+      - "{{ nagios_binary }}"
+      - -v
+      - "{{ nagios_etc_dir }}/nagios.cfg"
+  changed_when: false
+  listen: reload nagios
+
+- name: Reload Nagios
+  ansible.builtin.service:
+    name: "{{ nagios_service_name }}"
+    state: reloaded
+  listen: reload nagios

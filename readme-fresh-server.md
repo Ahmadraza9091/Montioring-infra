@@ -163,42 +163,47 @@ sudo make health
 
 After setup, Nagios is available at `https://<NAGIOS_DOMAIN>/nagios/`; sign in with `NAGIOS_ADMIN_USER` and `NAGIOS_ADMIN_PASSWORD` from `.env`. TBCOps is at `https://<OPSKNIGHT_DOMAIN>` and uses the account/login flow provided by the configured application image.
 
-## Can I use ngrok?
+## Add monitored client servers
 
-Yes, ngrok can provide temporary internet access for a preview, but it is **not a drop-in replacement for the two real DNS records in the production `make up` flow**. The SSL setup checks that both names resolve directly to the server and requests certificates for them. An ngrok hostname points to ngrok, so `make configure-ssl` will fail that check.
+After `sudo make up` has installed Nagios on this fresh server, you can use it as the Ansible controller to add NRPE-monitored Linux clients. Clients must be Debian/Ubuntu or RHEL/Rocky/Alma, reachable over SSH, and have a sudo-capable login. Set the Nagios server's client-reachable IP in `.env` before provisioning:
 
-For a TBCOps-only preview, you can tunnel directly to the app's loopback port, bypassing Nginx:
+```dotenv
+NAGIOS_SERVER_IP=<NAGIOS_SERVER_PRIVATE_OR_MONITORING_IP>
+ANSIBLE_USER=ubuntu
+ANSIBLE_SSH_KEY_PATH=~/.ssh/tbcops_ansible
+ANSIBLE_INVENTORY=ansible/inventory/hosts.ini
+NRPE_PORT=5666
+NRPE_CLIENT_SERVICES=nginx,docker,sshd
+```
 
-1. Complete the server installation with private `.test` names and `NGINX_ENABLE_SSL=false`, or install the required services in stages. Do not run `make configure-ssl` for an ngrok hostname.
-2. Install and authenticate the ngrok agent on the Ubuntu server using ngrok's official instructions. Start an HTTP tunnel to the local app port:
+Use the address the clients will see as the source for NRPE traffic; allow TCP/5666 from that address in any cloud or network ACL. The Ansible role adds a scoped UFW/firewalld rule only if that firewall is already active. It does not enable an inactive firewall.
 
-   ```bash
-   ngrok http 3001
-   ```
+Install the pinned Ansible tools and collections, then add a client to the inventory:
 
-3. Use the HTTPS hostname assigned by ngrok. If you change the app's public hostname, set the hostname (without scheme) and URLs in `.env`, for example:
+```bash
+sudo make install-ansible
+sudo make add-client IP=10.0.0.5 NAME=web01 USER=ubuntu
+```
 
-   ```dotenv
-   OPSKNIGHT_DOMAIN=<YOUR_NGROK_HOSTNAME>
-   OPSKNIGHT_PUBLIC_URL=https://<YOUR_NGROK_HOSTNAME>
-   NEXTAUTH_URL=https://<YOUR_NGROK_HOSTNAME>
-   NGINX_ENABLE_SSL=true
-   ```
+Generate the controller key, copy its public half to the client, and check SSH. On first key copy, enter the client SSH password and sudo/become password when prompted; neither is saved:
 
-   Keep `NAGIOS_DOMAIN` set to a different syntactically valid hostname, such as `nagios.test`. The repository's environment validator expects the TBCOps URL scheme to be HTTPS when `NGINX_ENABLE_SSL=true`.
+```bash
+sudo make ansible-ssh-key
+sudo make ansible-copy-key
+sudo make ansible-ping
+```
 
-4. Apply the updated app environment:
+Preview the changes before applying them, then verify NRPE end-to-end:
 
-   ```bash
-   sudo make check
-   sudo make deploy
-   ```
+```bash
+sudo make ansible-nrpe LIMIT=web01 CHECK=1
+sudo make ansible-nrpe LIMIT=web01
+sudo make ansible-verify
+```
 
-   `make deploy` does not run Certbot. Do not run `sudo make up` or `sudo make configure-ssl` with the ngrok hostname. Open the HTTPS URL shown by ngrok.
+The playbook installs NRPE and plugins on the client, detects installed packages/services, registers the host and checks in Nagios, validates configuration before reload, and prints a host/OS/NRPE/services summary. Re-running `ansible-nrpe` should converge with no changes. Remove a client with `sudo make remove-client NAME=web01`. For details and troubleshooting, see [docs/ANSIBLE_NRPE.md](./docs/ANSIBLE_NRPE.md).
 
-This is an advanced, app-only preview rather than a fully supported deployment mode. The repository's health check also tests Nagios at `NAGIOS_DOMAIN` when SSL is enabled, so that public Nagios check will not pass with the example `nagios.test`. NextAuth/cookie behavior should be verified through ngrok; a changing ngrok hostname must be written to `.env` and the app redeployed. If authentication or callbacks do not work correctly, use a real DNS hostname with the normal HTTPS setup instead.
-
-Ngrok makes the service reachable by anyone who has the tunnel URL unless you configure ngrok access controls. Do not tunnel a production instance or expose Nagios/admin interfaces without appropriate access restrictions.
+To include client provisioning in a future fresh `make up`, set `ENABLE_ANSIBLE_CLIENTS=true` in `.env` and ensure the Nagios IP and client inventory are already populated. Leave it `false` (the default) to preserve the normal fresh-server setup.
 
 ## Useful operations
 
